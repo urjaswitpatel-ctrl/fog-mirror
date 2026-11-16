@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fog Mirror - wipe the glass</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; background: #0c1116; color: #e8eef2;
+         font: 15px/1.5 -apple-system, system-ui, sans-serif; display: flex; flex-direction: column; align-items: center; }
+  header { width: 100%; max-width: 760px; padding: 18px 16px 10px; }
+  h1 { font-size: 20px; margin: 0 0 4px; font-weight: 600; }
+  .sub { margin: 0; color: #9fb0bc; font-size: 13.5px; }
+  .stage { position: relative; width: min(92vw, 430px); aspect-ratio: 3/4; border-radius: 22px; overflow: hidden;
+           background: #182530; box-shadow: 0 18px 50px rgba(0,0,0,.5); touch-action: none; }
+  .stage video, .stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .stage video { object-fit: cover; }
+  .stage video.mirror { transform: scaleX(-1); }
+  #fog { z-index: 2; }
+  #cursor { position: absolute; z-index: 3; width: 26px; height: 26px; margin: -13px 0 0 -13px; border: 2px solid rgba(255,255,255,.9);
+            border-radius: 50%; pointer-events: none; display: none; box-shadow: 0 0 10px rgba(255,255,255,.5); }
+  .controls { width: min(92vw, 430px); display: flex; gap: 10px; align-items: center; padding: 14px 2px; flex-wrap: wrap; }
+  button { background: #2f80ed; border: 0; color: #fff; font-size: 14px; padding: 10px 18px; border-radius: 999px; cursor: pointer; }
+  button.ghost { background: rgba(255,255,255,.12); }
+  label { font-size: 13px; color: #9fb0bc; display: flex; gap: 8px; align-items: center; }
+  #status { font-size: 12.5px; color: #7f95a5; width: 100%; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #556; margin-right: 6px; }
+  .dot.on { background: #37d67a; }
+  pre#selftest { max-width: 760px; font-size: 11px; white-space: pre-wrap; color: #7f95a5; padding: 0 16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Fog Mirror</h1>
+  <p class="sub" id="tagline">Wipe the fog with a finger in the air - the camera watches your fingertip. Touch works too. Nothing leaves the device.</p>
+</header>
+<div class="stage" id="stage">
+  <video id="cam" class="mirror" playsinline muted></video>
+  <canvas id="fog"></canvas>
+  <div id="cursor"></div>
+</div>
+<div class="controls">
+  <button id="start">Turn on the mirror</button>
+  <button id="refog" class="ghost">Fog it again</button>
+  <label>brush <input id="brush" type="range" min="26" max="110" value="56"></label>
+  <span id="status"><span class="dot" id="trackdot"></span><span id="statustext">idle</span></span>
+</div>
+<pre id="selftest"></pre>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker } from './vision_bundle.mjs';
+
+const W = 720, H = 960;
+const params = new URLSearchParams(location.search);
+// Public build: the reference reel and extracted frames are third-party
+// content and are not included. Demo modes show a note instead.
+const wantsDemo = params.has('testvideo') || params.has('selftest');
+const TESTVIDEO = false;
+const SELFTEST = false;
+if (wantsDemo) {
+  addEventListener('DOMContentLoaded', () => {
+    const t = document.getElementById('tagline');
+    if (t) t.textContent = 'Demo media is not part of this public site - turn on the mirror and wipe with your fingertip.';
+  });
+}
+
+const video = document.getElementById('cam');
+const fog = document.getElementById('fog');
+const stage = document.getElementById('stage');
+const cursor = document.getElementById('cursor');
+const statusText = document.getElementById('statustext');
+const trackDot = document.getElementById('trackdot');
+fog.width = W; fog.height = H;
+const fctx = fog.getContext('2d');
+
+// ---------- fog texture ----------
+function makeFogBase() {
+  const base = document.createElement('canvas');
+  base.width = W; base.height = H;
+  const c = base.getContext('2d');
+  c.fillStyle = 'rgba(223,230,235,0.97)'; c.fillRect(0, 0, W, H);
+  for (let i = 0; i < 260; i++) {
+    const x = Math.random() * W, y = Math.random() * H, r = 30 + Math.random() * 130;
+    const a = 0.04 + Math.random() * 0.09;
+    const shade = Math.random() < 0.55 ? '255,255,255' : '196,206,213';
+    const g = c.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, `rgba(${shade},${a})`); g.addColorStop(1, `rgba(${shade},0)`);
+    c.fillStyle = g; c.beginPath(); c.arc(x, y, r, 0, Math.PI * 2); c.fill();
+  }
+  for (let i = 0; i < 700; i++) {
+    const x = Math.random() * W, y = Math.random() * H, r = 0.6 + Math.random() * 2.4;
+    c.fillStyle = `rgba(255,255,255,${0.12 + Math.random() * 0.3})`;
+    c.beginPath(); c.arc(x, y, r, 0, Math.PI * 2); c.fill();
+  }
+  return base;
+}
+const fogBase = makeFogBase();
+const brushStamp = (() => {
+  const s = document.createElement('canvas'); s.width = 220; s.height = 220;
+  const c = s.getContext('2d');
+  const g = c.createRadialGradient(110, 110, 0, 110, 110, 110);
+  g.addColorStop(0, 'rgba(0,0,0,1)'); g.addColorStop(0.55, 'rgba(0,0,0,0.9)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = g; c.fillRect(0, 0, 220, 220);
+  return s;
+})();
+
+let brush = 56, prevPoint = null;
+function wipeAt(x, y) {
+  const r = brush;
+  fctx.globalCompositeOperation = 'destination-out';
+  fctx.globalAlpha = 1;
+  if (prevPoint) {
+    const dx = x - prevPoint.x, dy = y - prevPoint.y;
+    const n = Math.max(1, Math.ceil(Math.hypot(dx, dy) / Math.max(4, r * 0.35)));
+    for (let i = 1; i <= n; i++) {
+      fctx.drawImage(brushStamp, 0, 0, 220, 220, prevPoint.x + dx * i / n - r, prevPoint.y + dy * i / n - r, r * 2, r * 2);
+    }
+  } else {
+    fctx.drawImage(brushStamp, 0, 0, 220, 220, x - r, y - r, r * 2, r * 2);
+  }
+  prevPoint = { x, y };
+}
+function refog() { fctx.globalCompositeOperation = 'source-over'; fctx.globalAlpha = 1; fctx.drawImage(fogBase, 0, 0); prevPoint = null; }
+refog();
+document.getElementById('refog').onclick = refog;
+document.getElementById('brush').oninput = (e) => { brush = +e.target.value; };
+
+// touch / mouse wipe
+function stagePoint(e) {
+  const r = stage.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * (W / r.width), y: (e.clientY - r.top) * (H / r.height) };
+}
+let pointerDown = false;
+stage.addEventListener('pointerdown', (e) => { pointerDown = true; prevPoint = null; const p = stagePoint(e); wipeAt(p.x, p.y); });
+stage.addEventListener('pointermove', (e) => { if (pointerDown) { const p = stagePoint(e); wipeAt(p.x, p.y); } });
+addEventListener('pointerup', () => { pointerDown = false; prevPoint = null; });
+
+// ---------- hand tracking ----------
+let landmarker = null;
+async function loadLandmarker() {
+  if (landmarker) return landmarker;
+  const vision = await FilesetResolver.forVisionTasks('.');
+  landmarker = await HandLandmarker.createFromOptions(vision, {
+    baseOptions: { modelAssetPath: './hand_landmarker.task' },
+    runningMode: 'VIDEO', numHands: 1,
+    minHandDetectionConfidence: 0.4, minHandPresenceConfidence: 0.4, minTrackingConfidence: 0.4,
+  });
+  return landmarker;
+}
+
+let smooth = null, misses = 0, lastVideoTime = -1;
+function trackFrame(now) {
+  if (!landmarker || video.readyState < 2) return;
+  if (video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  const res = landmarker.detectForVideo(video, now);
+  if (res.landmarks && res.landmarks.length) {
+    const tip = res.landmarks[0][8]; // index fingertip
+    const nx = TESTVIDEO ? tip.x : 1 - tip.x; // match the mirrored preview
+    const raw = { x: nx * W, y: tip.y * H };
+    smooth = smooth ? { x: smooth.x + (raw.x - smooth.x) * 0.5, y: smooth.y + (raw.y - smooth.y) * 0.5 } : raw;
+    misses = 0;
+    wipeAt(smooth.x, smooth.y);
+    const r = stage.getBoundingClientRect();
+    cursor.style.display = 'block';
+    cursor.style.left = (smooth.x / W * r.width) + 'px';
+    cursor.style.top = (smooth.y / H * r.height) + 'px';
+    trackDot.className = 'dot on';
+    statusText.textContent = 'fingertip tracking - wiping';
+  } else {
+    cursor.style.display = 'none';
+    prevPoint = null;
+    if (++misses > 8) { smooth = null; trackDot.className = 'dot'; statusText.textContent = 'show a hand to the camera'; }
+  }
+}
+
+// slow re-fog so wiped trails gradually mist over
+let lastRefog = 0;
+function loop(now) {
+  trackFrame(now);
+  if (now - lastRefog > 120) {
+    lastRefog = now;
+    fctx.globalCompositeOperation = 'source-over';
+    fctx.globalAlpha = 0.012;
+    fctx.drawImage(fogBase, 0, 0);
+    fctx.globalAlpha = 1;
+  }
+  requestAnimationFrame(loop);
+}
+
+async function startMirror() {
+  document.getElementById('start').textContent = 'Starting...';
+  statusText.textContent = 'loading hand tracker';
+  try {
+    await loadLandmarker();
+    if (TESTVIDEO) {
+      video.classList.remove('mirror');
+      video.src = 'reel.mp4';
+      video.loop = true;
+      await video.play();
+    } else {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
+      video.srcObject = stream;
+      await video.play();
+    }
+    document.getElementById('start').style.display = 'none';
+    statusText.textContent = 'show a hand to the camera';
+    requestAnimationFrame(loop);
+  } catch (err) {
+    statusText.textContent = 'camera failed: ' + (err && err.message || err) + ' - touch wipe still works';
+    document.getElementById('start').textContent = 'Try again';
+  }
+}
+document.getElementById('start').onclick = startMirror;
+
+// ---------- selftest: replay extracted reel frames through the tracker ----------
+async function selftest() {
+  const out = document.getElementById('selftest');
+  const log = [];
+  try {
+    await loadLandmarker();
+    landmarker.setOptions({ runningMode: 'IMAGE' });
+    let detected = 0;
+    const total = 14;
+    for (let i = 1; i <= total; i++) {
+      const name = 'frames/f' + String(i).padStart(2, '0') + '.png';
+      const img = new Image();
+      await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = name; });
+      const r = landmarker.detect(img);
+      if (r.landmarks && r.landmarks.length) {
+        detected++;
+        const tip = r.landmarks[0][8];
+        wipeAt(tip.x * W, tip.y * H);
+        log.push(`${name}: hand ok score=${r.handedness[0][0].score.toFixed(3)} tip=(${tip.x.toFixed(2)},${tip.y.toFixed(2)})`);
+      } else {
+        log.push(`${name}: no hand`);
+      }
+    }
+    // measure cleared fog
+    const d = fctx.getImageData(0, 0, W, H).data;
+    let clear = 0, n = 0;
+    for (let j = 3; j < d.length; j += 16) { n++; if (d[j] < 128) clear++; }
+    const pct = (100 * clear / n).toFixed(1);
+    log.push(`RESULT hands=${detected}/${total} clearedFog=${pct}%`);
+    document.title = 'SELFTEST-DONE';
+  } catch (e) {
+    log.push('ERROR ' + (e && e.message || e));
+    document.title = 'SELFTEST-DONE';
+  }
+  out.textContent = log.join('\n');
+}
+if (SELFTEST) selftest();
+if (TESTVIDEO && !SELFTEST) {
+  document.getElementById('tagline').textContent = 'Test mode: the reference reel plays as the mirror feed; the tracker wipes where the fingertip moves.';
+  document.getElementById('start').textContent = 'Run the reel';
+}
+</script>
+</body>
+</html>
