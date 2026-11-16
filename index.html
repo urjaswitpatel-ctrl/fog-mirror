@@ -33,7 +33,7 @@
 <body>
 <header>
   <h1>Fog Mirror</h1>
-  <p class="sub" id="tagline">Wipe the fog with a finger in the air - the camera watches your fingertip. Touch works too. Nothing leaves the device.</p>
+  <p class="sub" id="tagline">Wipe the fog with a finger in the air - it stays wiped. Blow into the mic to fog the glass again. Camera and mic are only used live on this device; nothing is recorded or uploaded.</p>
 </header>
 <div class="stage" id="stage">
   <video id="cam" class="mirror" playsinline muted></video>
@@ -176,17 +176,54 @@ function trackFrame(now) {
 }
 
 // slow re-fog so wiped trails gradually mist over
-let lastRefog = 0;
+// Wiped areas stay clear until a blow on the mic (or the button) fogs the glass again.
 function loop(now) {
   trackFrame(now);
-  if (now - lastRefog > 120) {
-    lastRefog = now;
-    fctx.globalCompositeOperation = 'source-over';
-    fctx.globalAlpha = 0.012;
-    fctx.drawImage(fogBase, 0, 0);
-    fctx.globalAlpha = 1;
-  }
+  micFrame(now);
   requestAnimationFrame(loop);
+}
+
+// ---------- blow detection (mic) ----------
+// The mic is only analysed live in this page - audio is never recorded,
+// stored or sent anywhere. Loud sustained noise (a blow) brings the fog back.
+let audioCtx = null, analyser = null, micBuf = null;
+const BLOW = { thresh: 0.09, sustainMs: 220, cooldownMs: 2500 };
+let blowAboveSince = 0, blowLast = 0;
+function blowProcess(rms, now) {
+  if (now - blowLast < BLOW.cooldownMs) return false;
+  if (rms >= BLOW.thresh) {
+    if (!blowAboveSince) blowAboveSince = now;
+    if (now - blowAboveSince >= BLOW.sustainMs) {
+      blowLast = now;
+      blowAboveSince = 0;
+      refog();
+      statusText.textContent = 'blow heard - fog is back';
+      return true;
+    }
+  } else {
+    blowAboveSince = 0;
+  }
+  return false;
+}
+async function startMic() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = audioCtx.createMediaStreamSource(stream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 1024;
+    src.connect(analyser);
+    micBuf = new Uint8Array(analyser.fftSize);
+  } catch (e) {
+    analyser = null;
+  }
+}
+function micFrame(now) {
+  if (!analyser) return;
+  analyser.getByteTimeDomainData(micBuf);
+  let sum = 0;
+  for (let i = 0; i < micBuf.length; i++) { const v = (micBuf[i] - 128) / 128; sum += v * v; }
+  blowProcess(Math.sqrt(sum / micBuf.length), now);
 }
 
 async function startMirror() {
@@ -206,6 +243,7 @@ async function startMirror() {
     }
     document.getElementById('start').style.display = 'none';
     statusText.textContent = 'show a hand to the camera';
+    startMic();
     requestAnimationFrame(loop);
   } catch (err) {
     statusText.textContent = 'camera failed: ' + (err && err.message || err) + ' - touch wipe still works';
@@ -250,6 +288,16 @@ async function selftest() {
   }
   out.textContent = log.join('\n');
 }
+// test hooks: let automated checks drive the wipe and blow logic without hardware
+window.__fog = {
+  wipeAt, refog, blowProcess,
+  clearedPct: () => {
+    const d = fctx.getImageData(0, 0, W, H).data;
+    let c = 0, n = 0;
+    for (let j = 3; j < d.length; j += 16) { n++; if (d[j] < 128) c++; }
+    return 100 * c / n;
+  }
+};
 if (SELFTEST) selftest();
 if (TESTVIDEO && !SELFTEST) {
   document.getElementById('tagline').textContent = 'Test mode: the reference reel plays as the mirror feed; the tracker wipes where the fingertip moves.';
